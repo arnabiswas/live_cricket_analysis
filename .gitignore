@@ -9,6 +9,8 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+suquoia_data/
+outputs/
 develop-eggs/
 dist/
 downloads/

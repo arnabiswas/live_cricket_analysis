@@ -1,0 +1,25 @@
+#make it work for a list of files
+#for two groups
+#make sure heading is correct - copy conversion from my loom code
+
+
+- [x] Distance Travelled
+- [x] Baseline speed
+- [x] approach speed
+- [x] heading, cricket heading
+- [x] Movement map
+
+# Live cricket capture
+    - Approaches per video (successfull and unsuccessful)
+    - interceptions per video
+    - Fraction approaches distant
+
+- Time to capture
+- Speed around interception
+
+#Bar plots
+#histograms
+#cumulative plots
+
+
+# Video with labels
