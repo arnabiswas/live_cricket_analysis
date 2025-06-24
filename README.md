@@ -1,2 +1,2 @@
 # live_cricket_analysis
-Live cricket analysis
+Hoy lab analysis for live cricket capture
