@@ -203,8 +203,9 @@ def get_approach_events(distance_to_cricket,
                         heading_cricket_mouse,
                         processed_file,
                         distance_threshold=5,
-                        speed_threshold=10,
-                        heading_threshold=50,
+                        speed_threshold=8,
+                        heading_threshold=90,
+                        min_incomplete_duration=35,
                         plot=False):
     """
     Detect approach events by working backwards from cricket proximity events.
@@ -217,6 +218,7 @@ def get_approach_events(distance_to_cricket,
         distance_threshold: Approach detection threshold for distance to cricket (default: 5 cm)
         speed_threshold: Approach detection threshold for mouse speed (default: 5 cm/s)
         heading_threshold: Approach detection threshold for heading angle (default: 50 degrees either side of 0 so 100 degrees total)
+        min_incomplete_duration: Minimum duration in frames for incomplete approaches (default: 30)
         plot: Boolean, whether to create plots (default: False)
         
     Returns:
@@ -341,8 +343,14 @@ def get_approach_events(distance_to_cricket,
             # Check if mouse gets close to cricket during this sequence
             min_distance_during_seq = np.min(distance_to_cricket[seq_start:seq_end])
             
-            # Only keep if distance covered >= 10cm and mouse doesn't get within proximity threshold
-            if total_distance >= min_distance_approach and min_distance_during_seq >= distance_threshold:
+            # Check duration of the sequence
+            sequence_duration = seq_end - seq_start
+            
+            # Only keep if distance covered >= 10cm, mouse doesn't get within proximity threshold,
+            # and duration meets minimum threshold
+            if (total_distance >= min_distance_approach and 
+                min_distance_during_seq >= distance_threshold and
+                sequence_duration >= min_incomplete_duration):
                 incomplete_approaches.append((seq_start, seq_end))
     
     # Merge nearby incomplete approaches using same logic as complete approaches
@@ -395,16 +403,59 @@ def get_approach_events(distance_to_cricket,
             adjusted_chase_events.append((start, end))
         # If first_proximity_frame == start, this means proximity starts immediately, skip this approach
     
+    # Merge complete and incomplete approaches based on the same criteria
+    all_approaches = adjusted_chase_events + merged_incomplete_approaches
+    
+    # Sort all approaches by start time, then by end time
+    all_approaches.sort(key=lambda x: (x[0], x[1]))
+    
+    # Merge nearby approaches using same logic
+    final_merged_approaches = []
+    if all_approaches:
+        current_start, current_end = all_approaches[0]
+        current_is_complete = (current_start, current_end) in adjusted_chase_events
+        
+        for i in range(1, len(all_approaches)):
+            next_start, next_end = all_approaches[i]
+            next_is_complete = (next_start, next_end) in adjusted_chase_events
+            
+            # Check if this is the same approach start
+            if next_start == current_start:
+                # Same start, extend to the latest end and mark as complete if either is complete
+                current_end = max(current_end, next_end)
+                current_is_complete = current_is_complete or next_is_complete
+            else:
+                # Different start, check if approaches should be merged based on proximity
+                frame_gap = next_start - current_end
+                distance_diff = abs(distance_to_cricket[next_start] - distance_to_cricket[current_end])
+                
+                if frame_gap < max_gap and distance_diff < distance_diff_threshold:
+                    # Merge: extend current approach to include next approach
+                    current_end = next_end
+                    current_is_complete = current_is_complete or next_is_complete
+                else:
+                    # Don't merge: save current approach and start new one
+                    final_merged_approaches.append((current_start, current_end, current_is_complete))
+                    current_start, current_end = next_start, next_end
+                    current_is_complete = next_is_complete
+        
+        # Add the last approach
+        final_merged_approaches.append((current_start, current_end, current_is_complete))
+    
+    # Separate back into complete and incomplete approaches
+    final_complete_approaches = [(start, end) for start, end, is_complete in final_merged_approaches if is_complete]
+    final_incomplete_approaches = [(start, end) for start, end, is_complete in final_merged_approaches if not is_complete]
+    
     # Create plots if requested
     if plot:
-        # Create chase condition array using adjusted events
+        # Create chase condition array using final complete events
         chase_condition = np.zeros_like(distance_to_cricket < 5, dtype=bool)
-        for start, end in adjusted_chase_events:
+        for start, end in final_complete_approaches:
             chase_condition[start:end+1] = True
         
-        # Create incomplete approach condition array
+        # Create incomplete approach condition array using final incomplete events
         incomplete_condition = np.zeros_like(distance_to_cricket < 5, dtype=bool)
-        for start, end in merged_incomplete_approaches:
+        for start, end in final_incomplete_approaches:
             incomplete_condition[start:end] = True
 
         # Convert frame indices to seconds (30 fps)
@@ -436,7 +487,7 @@ def get_approach_events(distance_to_cricket,
         axes[5].set_ylabel('Incomplete Approach')
         axes[5].set_xlabel('Time (seconds)')
     
-    return adjusted_chase_events, merged_incomplete_approaches
+    return final_complete_approaches, final_incomplete_approaches
 
 def get_head_position(dataframe):
     head_x = (dataframe.leftearx + dataframe.rightearx) / 2
@@ -590,3 +641,216 @@ def create_combined_analysis_plot(processed_file,
     plt.tight_layout()
     
     return fig
+
+def process_gf_cv_mouse_experiment(files):
+    """
+    Process mouse behavioral data for germ free and control from a list of files and organize into a dictionary.
+    
+    Args:
+        files (list): List of file paths to process files for germ free and control, should be passed separately for each group
+        
+    Returns:
+        dict: Dictionary containing processed mouse data organized by mouse ID
+    """
+    mouse_data = {}
+
+    for file in files:
+        processed_file = pd.read_excel(file)
+        mouse_speed = get_mouse_speed(processed_file)
+        heading_cricket_mouse = get_mouse_heading_to_cricket(processed_file)
+        distance_to_cricket = get_distance_to_cricket(processed_file)
+        distance_travelled = get_distance_travelled(processed_file)
+        time_to_capture = len(processed_file) / 30
+        approach_events, incomplete_approach_events = get_approach_events(distance_to_cricket, mouse_speed, heading_cricket_mouse, processed_file)
+        group, day, mouse_id, sex, trial = parse_filename(file)
+
+        # Create a unique key based on group and mouse_id
+        mouse_key = f"{group}-{mouse_id}-{sex}-{day}"
+        
+        # Initialize the mouse entry if it doesn't exist
+        if mouse_key not in mouse_data:
+            mouse_data[mouse_key] = {
+                'mouse_speed': [],
+                'heading_cricket_mouse': [],
+                'distance_to_cricket': [],
+                'approach_events': [],
+                'incomplete_approach_events': [],
+                'sex': sex,
+                'mouse_id': mouse_id, 
+                'group': group,
+                'distance_travelled': [],
+                'time_to_capture': [],
+                'trials': [],
+                'train_days': []
+            }
+        
+        # Append trial data to the existing mouse entry
+        mouse_data[mouse_key]['mouse_speed'].append(mouse_speed)
+        mouse_data[mouse_key]['heading_cricket_mouse'].append(heading_cricket_mouse)
+        mouse_data[mouse_key]['distance_to_cricket'].append(distance_to_cricket)
+        mouse_data[mouse_key]['approach_events'].append(approach_events)
+        mouse_data[mouse_key]['incomplete_approach_events'].append(incomplete_approach_events)
+        mouse_data[mouse_key]['distance_travelled'].append(distance_travelled)
+        mouse_data[mouse_key]['time_to_capture'].append(time_to_capture)
+        mouse_data[mouse_key]['trials'].append(trial)
+        mouse_data[mouse_key]['train_days'].append(day)
+        
+    return mouse_data
+
+def average_gf_cv_mouse_experiment_data(data):
+    average_data = {}
+
+    for key in data.keys():
+        new_key = key[:-2]
+        day = key[-1:]
+        
+        if new_key not in average_data:
+            average_data[new_key] = {
+                'all': {
+                    'heading_cricket_mouse': [],
+                    'mouse_speed': [],
+                    'distance_to_cricket': [],
+                    'num_approach_events': [],
+                    'num_incomplete_approach_events': [],
+                    'distance_travelled': [],
+                    'time_to_capture': [],
+                    'distance_to_cricket_at_approach_start': [],
+                    'average_speed_during_interception': [],
+                    'max_speed_during_interception': [],
+                    'heading_cricket_mouse+-5': [],
+                    'mouse_speed+-5': [],
+                    'distance_to_cricket+-5': []
+                }
+            }
+
+        for i, approach_events in enumerate(data[key]['approach_events']):
+            if day not in average_data[new_key]:
+                average_data[new_key][day] = {
+                    # Regular data during approach
+                    'heading_cricket_mouse': [],
+                    'mouse_speed': [],
+                    'distance_to_cricket': [],
+                    'num_approach_events': [],
+                    'num_incomplete_approach_events': [],
+                    'average_speed_during_interception': [],
+                    'max_speed_during_interception': [],
+                    'distance_to_cricket_at_approach_start': [],
+                    'distance_travelled': [],
+                    'time_to_capture': [],
+                    'heading_cricket_mouse+-5': [],
+                    'mouse_speed+-5': [],
+                    'distance_to_cricket+-5': []
+                }
+                
+            # Set the event counts once per video, not per event
+            average_data[new_key][day]['num_approach_events'].append(len(data[key]['approach_events'][i]))
+            average_data[new_key][day]['num_incomplete_approach_events'].append(len(data[key]['incomplete_approach_events'][i]))
+            average_data[new_key][day]['distance_travelled'].append(data[key]['distance_travelled'][i])
+            average_data[new_key][day]['time_to_capture'].append(data[key]['time_to_capture'][i])
+                
+            for start, end in approach_events:
+                # Regular data during approach
+                average_data[new_key][day]['heading_cricket_mouse'].append(data[key]['heading_cricket_mouse'][i][start:end])
+                average_data[new_key][day]['mouse_speed'].append(data[key]['mouse_speed'][i][start:end])
+                average_data[new_key][day]['distance_to_cricket'].append(data[key]['distance_to_cricket'][i][start:end])
+                average_data[new_key][day]['distance_to_cricket_at_approach_start'].append(data[key]['distance_to_cricket'][i][start])
+                # Calculate sliding window average of size 2
+                speed_data = data[key]['mouse_speed'][i][start:end]
+                sliding_avg = np.convolve(speed_data, np.ones(2)/2, mode='valid')
+                
+                average_data[new_key][day]['average_speed_during_interception'].append(np.nanmean(sliding_avg[-30:]))
+                average_data[new_key][day]['max_speed_during_interception'].append(np.nanmax(sliding_avg[-30:]))
+                
+                # Extended data ±150 indices around end
+                extended_start = end - 150
+                extended_end = end + 150
+                
+                # Create padded arrays filled with NaN
+                heading_padded = np.full(300, np.nan)
+                speed_padded = np.full(300, np.nan)
+                distance_padded = np.full(300, np.nan)
+                
+                # Get actual data
+                data_start = max(0, extended_start)
+                data_end = min(len(data[key]['heading_cricket_mouse'][i]), extended_end)
+                
+                # Calculate where in padded array to put the actual data
+                pad_start = max(0, 150 - end)  # If too close to start
+                pad_end = min(300, 300 - (extended_end - data_end))  # If too close to end
+                
+                # Insert actual data into padded arrays
+                heading_padded[pad_start:pad_end] = data[key]['heading_cricket_mouse'][i][data_start:data_end]
+                speed_padded[pad_start:pad_end] = data[key]['mouse_speed'][i][data_start:data_end]
+                distance_padded[pad_start:pad_end] = data[key]['distance_to_cricket'][i][data_start:data_end]
+                
+                # Store padded arrays
+                average_data[new_key][day]['heading_cricket_mouse+-5'].append(heading_padded)
+                average_data[new_key][day]['mouse_speed+-5'].append(speed_padded)
+                average_data[new_key][day]['distance_to_cricket+-5'].append(distance_padded)
+                
+                # Also append to 'all' key
+                average_data[new_key]['all']['heading_cricket_mouse'].append(data[key]['heading_cricket_mouse'][i][start:end])
+                average_data[new_key]['all']['mouse_speed'].append(data[key]['mouse_speed'][i][start:end])
+                average_data[new_key]['all']['distance_to_cricket'].append(data[key]['distance_to_cricket'][i][start:end])
+                average_data[new_key]['all']['heading_cricket_mouse+-5'].append(heading_padded)
+                average_data[new_key]['all']['mouse_speed+-5'].append(speed_padded)
+                average_data[new_key]['all']['distance_to_cricket+-5'].append(distance_padded)
+                average_data[new_key]['all']['distance_to_cricket_at_approach_start'].append(data[key]['distance_to_cricket'][i][start])
+                average_data[new_key]['all']['average_speed_during_interception'].append(np.nanmean(sliding_avg[-30:]))
+                average_data[new_key]['all']['max_speed_during_interception'].append(np.nanmax(sliding_avg[-30:]))
+
+            # Add counts to 'all' once per video, not per event
+            average_data[new_key]['all']['num_approach_events'].append(len(data[key]['approach_events'][i]))
+            average_data[new_key]['all']['num_incomplete_approach_events'].append(len(data[key]['incomplete_approach_events'][i]))
+            average_data[new_key]['all']['distance_travelled'].append(data[key]['distance_travelled'][i])
+            average_data[new_key]['all']['time_to_capture'].append(data[key]['time_to_capture'][i])
+                
+    return average_data
+
+#WIP: CHECK THIS FUNCTION
+def pad_sequences(sequences, filter_size=3):
+    from scipy.ndimage import median_filter
+    from scipy.interpolate import interp1d
+    
+    # First interpolate NaNs and apply median filter to each sequence
+    processed_sequences = []
+    for seq in sequences:
+        seq = np.array(seq)
+        if len(seq) == 0:
+            processed_sequences.append(seq)
+            continue
+            
+        # Interpolate intermediate NaNs
+        if np.any(np.isnan(seq)):
+            valid_mask = ~np.isnan(seq)
+            if np.sum(valid_mask) > 1:  # Need at least 2 points to interpolate
+                valid_indices = np.where(valid_mask)[0]
+                valid_values = seq[valid_mask]
+                interp_func = interp1d(valid_indices, valid_values, 
+                                     kind='linear', bounds_error=False, 
+                                     fill_value='extrapolate')
+                seq = interp_func(np.arange(len(seq)))
+        
+        # Apply median filter for smoothing
+        if len(seq) >= filter_size:
+            seq = median_filter(seq, size=filter_size)
+        
+        processed_sequences.append(seq)
+    
+    # Then pad sequences with NaNs
+    max_len = max(len(seq) for seq in processed_sequences)
+    padded_sequences = np.array([np.pad(seq, (max_len - len(seq), 0),
+                                    constant_values=np.nan)
+
+                                for seq in processed_sequences])
+    return padded_sequences
+
+def parse_filename(filename):
+    """Parse filename to extract day, mouse_id, sex, trial"""
+    basename = filename.split('/')[-1]
+    group = basename.split('-')[1][0]
+    day = basename.split('-')[0][1]
+    mouse_id = basename.split('_')[1]
+    sex = basename.split('_')[2][0]
+    trial = basename.split('-')[2][0]
+    return group, day, mouse_id, sex, trial
